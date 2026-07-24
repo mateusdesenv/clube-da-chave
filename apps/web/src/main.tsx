@@ -67,22 +67,82 @@ const seed: Store = {
 
 const STORAGE_KEY = 'clube-da-chave.app.v1';
 const fmtDate = (value: string) => new Intl.DateTimeFormat('pt-BR', { day:'2-digit', month:'short', year:'numeric' }).format(new Date(`${value}T12:00:00`));
+const maskPhone = (value:string) => {
+  const digits=value.replace(/\D/g,'').slice(0,11);
+  if(!digits)return '';
+  if(digits.length<=2)return `(${digits}`;
+  const area=digits.slice(0,2);
+  const number=digits.slice(2);
+  if(number.length<=4)return `(${area}) ${number}`;
+  if(digits.length<=10)return `(${area}) ${number.slice(0,4)}-${number.slice(4)}`;
+  return `(${area}) ${number.slice(0,5)}-${number.slice(5)}`;
+};
+const normalizeEmail = (value:string) => value.replace(/\s/g,'').toLocaleLowerCase('pt-BR');
 const uid = () => Math.random().toString(36).slice(2, 9);
 const bracketRounds = ['Oitavas de final', 'Quartas de final', 'Semifinais', 'Final'];
 const matchWinner = (match:Match) => match.winner || (match.scoreA!==undefined && match.scoreB!==undefined && match.scoreA!==match.scoreB ? (match.scoreA>match.scoreB?match.a:match.b) : undefined);
 
-function useStore() {
+function migrateStore(value:Partial<Store>):Store {
+  const tournaments = Array.isArray(value.tournaments) ? value.tournaments : seed.tournaments;
+  const knownNames = Array.from(new Set(tournaments.flatMap(t=>t.players)));
+  const players = Array.isArray(value.players) ? value.players : knownNames.map((name,i)=>({id:`migrado-${i}`,name,email:'',phone:'',club:''}));
+  return {
+    schemaVersion:2,
+    tournaments:tournaments.map(t=>({...t,rules:t.rules||{modality:'8-Ball',raceTo:4,tiebreak:'Frame decisivo',timeLimit:60},enrollments:t.enrollments||Object.fromEntries(t.players.map(n=>[n,'Confirmado']))})),
+    matches:(Array.isArray(value.matches) ? value.matches : seed.matches).map(m=>({...m,status:m.status||(m.scoreA!==undefined?'Concluída':'Agendada')})),
+    players,
+    users:Array.isArray(value.users) ? value.users : seed.users,
+    tables:Array.isArray(value.tables) ? value.tables : seed.tables,
+    events:Array.isArray(value.events) ? value.events : []
+  };
+}
+
+function useStore(currentUser:FirebaseUser|null) {
   const [data, setData] = useState<Store>(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '') as Partial<Store>;
-      const tournaments = saved.tournaments || seed.tournaments;
-      const knownNames = Array.from(new Set(tournaments.flatMap(t=>t.players)));
-      const players = saved.players || knownNames.map((name,i)=>({id:`migrado-${i}`,name,email:'',phone:'',club:''}));
-      return { schemaVersion:2, tournaments:tournaments.map(t=>({...t,rules:t.rules||{modality:'8-Ball',raceTo:4,tiebreak:'Frame decisivo',timeLimit:60},enrollments:t.enrollments||Object.fromEntries(t.players.map(n=>[n,'Confirmado']))})), matches:(saved.matches || seed.matches).map(m=>({...m,status:m.status||(m.scoreA!==undefined?'Concluída':'Agendada')})), players, users:saved.users || seed.users, tables:saved.tables||seed.tables, events:saved.events||[] };
+      return migrateStore(saved);
     }
     catch { return seed; }
   });
+  const [remoteReady,setRemoteReady]=useState(false);
+
   useEffect(() => localStorage.setItem(STORAGE_KEY, JSON.stringify(data)), [data]);
+
+  useEffect(()=>{
+    if(!currentUser){setRemoteReady(false);return}
+    let active=true;
+    const hydrate=async()=>{
+      try {
+        const token=await currentUser.getIdToken();
+        const headers={Authorization:`Bearer ${token}`};
+        const response=await fetch('/api/data',{headers});
+        if(!response.ok)throw new Error(`API ${response.status}`);
+        const payload=await response.json() as {data?:Partial<Store>|null};
+        if(!active)return;
+        if(payload.data)setData(migrateStore(payload.data));
+        else {
+          const created=await fetch('/api/data',{method:'PUT',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify(data)});
+          if(!created.ok)throw new Error(`API ${created.status}`);
+        }
+      }
+      catch(error){console.warn('API indisponível; mantendo os dados deste navegador.',error)}
+      finally{if(active)setRemoteReady(true)}
+    };
+    void hydrate();
+    return()=>{active=false};
+  },[currentUser]);
+
+  useEffect(()=>{
+    if(!remoteReady||!currentUser)return;
+    const timeout=window.setTimeout(()=>{
+      void currentUser.getIdToken().then(token=>fetch('/api/data',{method:'PUT',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(data)}))
+        .then(response=>{if(!response.ok)throw new Error(`API ${response.status}`)})
+        .catch(error=>console.warn('Não foi possível sincronizar com o servidor.',error));
+    },700);
+    return()=>window.clearTimeout(timeout);
+  },[data,remoteReady,currentUser]);
+
   return [data, setData] as const;
 }
 
@@ -259,7 +319,17 @@ function PublicView({item,matches}:{item:Tournament;matches:Match[]}) {
   return <section className="public-view"><header><Logo/><div><small>ACOMPANHAMENTO LOCAL</small><h2>{item.theme?.shortName||item.name}</h2></div><button className="secondary" onClick={()=>document.documentElement.requestFullscreen?.()}><Monitor size={16}/>Tela cheia</button></header>{champion&&<div className="public-champion"><Crown/><span>Campeão</span><strong>{champion}</strong></div>}<div className="public-grid"><section><h3>Agora nas mesas</h3>{current.length?current.map(m=><article key={m.id}><span>{m.table}</span><strong>{m.a} <b>{m.scoreA??0}</b> × <b>{m.scoreB??0}</b> {m.b}</strong><small>{m.status}</small></article>):<Empty text="Nenhuma partida em andamento"/>}</section><section><h3>Próximas partidas</h3>{next.map(m=><article key={m.id}><span>{m.time} · {m.table}</span><strong>{m.a} × {m.b}</strong><small>{m.round}</small></article>)}</section></div></section>;
 }
 
-function PlayerForm({initial,onSave,onClose}:{initial?:Player;onSave:(p:Player)=>void;onClose:()=>void}) { const [form,setForm]=useState<Player>(initial||{id:uid(),name:'',email:'',phone:'',club:''});const change=(key:keyof Player,value:string)=>setForm({...form,[key]:value});return <Modal title={initial?'Editar jogador':'Novo jogador'} onClose={onClose}><form className="form-grid" onSubmit={e=>{e.preventDefault();onSave(form)}}><label className="full">Nome completo<input required value={form.name} onChange={e=>change('name',e.target.value)} placeholder="Nome do jogador"/></label><label>E-mail<input type="email" value={form.email} onChange={e=>change('email',e.target.value)} placeholder="jogador@email.com"/></label><label>Telefone<input value={form.phone} onChange={e=>change('phone',e.target.value)} placeholder="(11) 99999-9999"/></label><label className="full">Clube<input value={form.club} onChange={e=>change('club',e.target.value)} placeholder="Clube ou salão"/></label><div className="modal-actions full"><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button className="primary">Salvar jogador</button></div></form></Modal>}
+function PlayerForm({initial,onSave,onClose}:{initial?:Player;onSave:(p:Player)=>void;onClose:()=>void}) {
+  const [form,setForm]=useState<Player>(initial?{...initial,email:normalizeEmail(initial.email),phone:maskPhone(initial.phone)}:{id:uid(),name:'',email:'',phone:'',club:''});
+  const change=(key:keyof Player,value:string)=>setForm({...form,[key]:value});
+  return <Modal title={initial?'Editar jogador':'Novo jogador'} onClose={onClose}><form className="form-grid" onSubmit={e=>{e.preventDefault();onSave({...form,email:normalizeEmail(form.email),phone:maskPhone(form.phone)})}}>
+    <label className="full">Nome completo<input required autoComplete="name" value={form.name} onChange={e=>change('name',e.target.value)} placeholder="Nome do jogador"/></label>
+    <label>E-mail<input type="email" inputMode="email" autoComplete="email" value={form.email} onChange={e=>change('email',normalizeEmail(e.target.value))} placeholder="jogador@email.com"/></label>
+    <label>Telefone<input type="tel" inputMode="tel" autoComplete="tel-national" maxLength={15} pattern="\(\d{2}\) \d{4,5}-\d{4}" title="Informe o DDD e um telefone com 8 ou 9 dígitos" value={form.phone} onChange={e=>change('phone',maskPhone(e.target.value))} placeholder="(11) 99999-9999"/></label>
+    <label className="full">Clube<input value={form.club} onChange={e=>change('club',e.target.value)} placeholder="Clube ou salão"/></label>
+    <div className="modal-actions full"><button type="button" className="secondary" onClick={onClose}>Cancelar</button><button className="primary">Salvar jogador</button></div>
+  </form></Modal>;
+}
 
 function Participants({data,setData}:{data:Store;setData:React.Dispatch<React.SetStateAction<Store>>}) { const [editing,setEditing]=useState<Player|null|undefined>();const [query,setQuery]=useState('');const list=useMemo(()=>data.players.filter(p=>p.name.toLowerCase().includes(query.toLowerCase())||p.club.toLowerCase().includes(query.toLowerCase())),[data.players,query]);const save=(player:Player)=>{setData(d=>{const old=d.players.find(p=>p.id===player.id);return {...d,players:old?d.players.map(p=>p.id===player.id?player:p):[player,...d.players],tournaments:old&&old.name!==player.name?d.tournaments.map(t=>({...t,players:t.players.map(n=>n===old.name?player.name:n)})):d.tournaments,matches:old&&old.name!==player.name?d.matches.map(m=>({...m,a:m.a===old.name?player.name:m.a,b:m.b===old.name?player.name:m.b})):d.matches}});setEditing(undefined)};const remove=(player:Player)=>{if(!confirm(`Excluir ${player.name}?`))return;setData(d=>({...d,players:d.players.filter(p=>p.id!==player.id),tournaments:d.tournaments.map(t=>({...t,players:t.players.filter(n=>n!==player.name)})),matches:d.matches.filter(m=>m.a!==player.name&&m.b!==player.name)}))};return <div className="page"><div className="page-head"><div><div className="eyebrow">CADASTROS</div><h1>Jogadores</h1><p className="muted">Cadastre os jogadores antes de associá-los aos campeonatos.</p></div><button className="primary" onClick={()=>setEditing(null)}><Plus size={18}/> Novo jogador</button></div><div className="toolbar player-toolbar"><label className="search"><Search size={17}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Buscar por nome ou clube"/></label><span>{data.players.length} jogador(es) cadastrados</span></div><section className="card player-table"><div className="table-wrap"><table><thead><tr><th>Jogador</th><th>Contato</th><th>Clube</th><th>Campeonatos</th><th/></tr></thead><tbody>{list.map(p=><tr key={p.id}><td><div className="player-cell"><span className="avatar">{p.name.split(' ').map(x=>x[0]).slice(0,2).join('')}</span><strong>{p.name}</strong></div></td><td><span>{p.email||'—'}</span><small>{p.phone||'Sem telefone'}</small></td><td>{p.club||'—'}</td><td>{data.tournaments.filter(t=>t.players.includes(p.name)).length}</td><td><div className="inline-actions"><button className="icon-button" onClick={()=>setEditing(p)} title="Editar"><Pencil size={16}/></button><button className="icon-button danger" onClick={()=>remove(p)} title="Excluir"><Trash2 size={16}/></button></div></td></tr>)}</tbody></table>{!list.length&&<Empty text="Nenhum jogador encontrado"/>}</div></section>{editing!==undefined&&<PlayerForm initial={editing||undefined} onSave={save} onClose={()=>setEditing(undefined)}/>}</div>; }
 
@@ -286,11 +356,11 @@ function SettingsPage({data,setData,reset}:{data:Store;setData:React.Dispatch<Re
   const removeOne=(key:DomainKey,item:DomainItem)=>{if(confirm(`Apagar “${labelFor(key,item)}”? Esta ação não pode ser desfeita.`)){removeItems(key,[item.id]);setNotice('Registro apagado com sucesso.')}};
   const removeAll=(key:DomainKey)=>{if(confirm(`Apagar todos os registros de ${domainMeta[key].label.toLowerCase()}? Dados relacionados também poderão ser removidos.`)){removeItems(key,data[key].map(x=>x.id));setNotice(`${domainMeta[key].label} apagados.`)}};
   const importDomain=async(key:DomainKey,file:File)=>{try{const parsed=JSON.parse(await file.text()) as unknown;const payload=Array.isArray(parsed)?parsed:(parsed&&typeof parsed==='object'&&'data' in parsed?(parsed as {data:unknown}).data:null);if(!Array.isArray(payload)||payload.some(item=>!item||typeof item!=='object'||typeof (item as {id?:unknown}).id!=='string'))throw new Error('Formato inválido');if(!confirm(`Substituir todos os dados de ${domainMeta[key].label.toLowerCase()} pelos ${payload.length} registros deste arquivo?`))return;setData(current=>{if(key==='users')return {...current,users:payload as User[]};if(key==='tables')return {...current,tables:payload as PoolTable[]};if(key==='events')return {...current,events:payload as AuditEvent[]};if(key==='matches'){const tournamentIds=new Set(current.tournaments.map(t=>t.id));return {...current,matches:(payload as Match[]).filter(m=>tournamentIds.has(m.tournamentId))}}if(key==='tournaments'){const tournaments=payload as Tournament[];const ids=new Set(tournaments.map(t=>t.id));return {...current,tournaments,matches:current.matches.filter(m=>ids.has(m.tournamentId))}}const players=payload as Player[];const names=new Set(players.map(p=>p.name));return {...current,players,tournaments:current.tournaments.map(t=>({...t,players:t.players.filter(n=>names.has(n))})),matches:current.matches.filter(m=>names.has(m.a)&&names.has(m.b))}});setNotice(`${payload.length} registro(s) importado(s) em ${domainMeta[key].label}.`)}catch{setNotice('Não foi possível importar: o JSON está inválido ou não contém uma lista de registros.')}};
-  return <div className="page settings-page"><div className="page-head"><div><div className="eyebrow">PREFERÊNCIAS</div><h1>Configurações</h1><p className="muted">Gerencie, transfira ou limpe os dados salvos neste navegador.</p></div><button className="secondary" onClick={reset}><Database size={17}/> Restaurar demonstração</button></div>{notice&&<div className="data-notice" role="status"><Check size={16}/>{notice}<button className="icon-button" onClick={()=>setNotice('')}><X size={15}/></button></div>}<div className="data-summary">{(Object.keys(domainMeta) as DomainKey[]).map(key=><article key={key}><span>{domainMeta[key].label}</span><strong>{data[key].length}</strong></article>)}</div><div className="domain-stack">{(Object.keys(domainMeta) as DomainKey[]).map(key=>{const meta=domainMeta[key];const Icon=meta.icon;const items=data[key] as DomainItem[];const open=openDomain===key;return <section className={`card domain-card ${open?'open':''}`} key={key}><button className="domain-heading" onClick={()=>setOpenDomain(open?null:key)} aria-expanded={open}><span className="domain-icon"><Icon size={20}/></span><span><strong>{meta.label}</strong><small>{meta.description}</small></span><span className="domain-count">{items.length}</span><ChevronRight className="domain-chevron" size={18}/></button>{open&&<div className="domain-content"><div className="domain-actions"><button className="secondary" onClick={()=>exportDomain(key)} disabled={!items.length}><Download size={16}/> Exportar todos</button><label className="secondary data-action"><Upload size={16}/> Importar JSON<input type="file" accept="application/json,.json" onChange={e=>{const file=e.target.files?.[0];if(file)void importDomain(key,file);e.target.value=''}}/></label><button className="secondary danger" onClick={()=>removeAll(key)} disabled={!items.length}><Trash2 size={16}/> Apagar todos</button></div><div className="domain-list">{items.length?items.map(item=><article key={item.id}><span className="file-icon"><FileJson size={17}/></span><span className="domain-item-copy"><strong>{labelFor(key,item)}</strong><small>{detailFor(key,item)}</small></span><button className="icon-button" onClick={()=>exportItem(key,item)} title="Exportar registro"><Download size={16}/></button><button className="icon-button danger" onClick={()=>removeOne(key,item)} title="Apagar registro"><Trash2 size={16}/></button></article>):<Empty text={`Nenhum registro em ${meta.label.toLowerCase()}`}/>}</div></div>}</section>})}</div><section className="danger-zone"><div><strong>Zona de risco</strong><p>Restaure todos os domínios para os dados originais da demonstração.</p></div><button className="secondary danger" onClick={reset}><Trash2 size={17}/> Restaurar todos os dados</button></section></div>;
+  return <div className="page settings-page"><div className="page-head"><div><div className="eyebrow">PREFERÊNCIAS</div><h1>Configurações</h1><p className="muted">Gerencie, transfira ou limpe os dados sincronizados do sistema.</p></div><button className="secondary" onClick={reset}><Database size={17}/> Restaurar demonstração</button></div>{notice&&<div className="data-notice" role="status"><Check size={16}/>{notice}<button className="icon-button" onClick={()=>setNotice('')}><X size={15}/></button></div>}<div className="data-summary">{(Object.keys(domainMeta) as DomainKey[]).map(key=><article key={key}><span>{domainMeta[key].label}</span><strong>{data[key].length}</strong></article>)}</div><div className="domain-stack">{(Object.keys(domainMeta) as DomainKey[]).map(key=>{const meta=domainMeta[key];const Icon=meta.icon;const items=data[key] as DomainItem[];const open=openDomain===key;return <section className={`card domain-card ${open?'open':''}`} key={key}><button className="domain-heading" onClick={()=>setOpenDomain(open?null:key)} aria-expanded={open}><span className="domain-icon"><Icon size={20}/></span><span><strong>{meta.label}</strong><small>{meta.description}</small></span><span className="domain-count">{items.length}</span><ChevronRight className="domain-chevron" size={18}/></button>{open&&<div className="domain-content"><div className="domain-actions"><button className="secondary" onClick={()=>exportDomain(key)} disabled={!items.length}><Download size={16}/> Exportar todos</button><label className="secondary data-action"><Upload size={16}/> Importar JSON<input type="file" accept="application/json,.json" onChange={e=>{const file=e.target.files?.[0];if(file)void importDomain(key,file);e.target.value=''}}/></label><button className="secondary danger" onClick={()=>removeAll(key)} disabled={!items.length}><Trash2 size={16}/> Apagar todos</button></div><div className="domain-list">{items.length?items.map(item=><article key={item.id}><span className="file-icon"><FileJson size={17}/></span><span className="domain-item-copy"><strong>{labelFor(key,item)}</strong><small>{detailFor(key,item)}</small></span><button className="icon-button" onClick={()=>exportItem(key,item)} title="Exportar registro"><Download size={16}/></button><button className="icon-button danger" onClick={()=>removeOne(key,item)} title="Apagar registro"><Trash2 size={16}/></button></article>):<Empty text={`Nenhum registro em ${meta.label.toLowerCase()}`}/>}</div></div>}</section>})}</div><section className="danger-zone"><div><strong>Zona de risco</strong><p>Restaure todos os domínios para os dados originais da demonstração.</p></div><button className="secondary danger" onClick={reset}><Trash2 size={17}/> Restaurar todos os dados</button></section></div>;
 }
 
 function App() {
-  const [currentUser,setCurrentUser]=useState<FirebaseUser|null>(null); const [authLoading,setAuthLoading]=useState(true); const [page,setPage]=useState<Page>('dashboard'); const [selected,setSelected]=useState<string>(); const [createOnOpen,setCreateOnOpen]=useState(false); const [data,setData]=useStore();
+  const [currentUser,setCurrentUser]=useState<FirebaseUser|null>(null); const [authLoading,setAuthLoading]=useState(true); const [page,setPage]=useState<Page>('dashboard'); const [selected,setSelected]=useState<string>(); const [createOnOpen,setCreateOnOpen]=useState(false); const [data,setData]=useStore(currentUser);
   useEffect(()=>onAuthStateChanged(auth,user=>{setCurrentUser(user);setAuthLoading(false)}),[]);
   const login=async()=>{await loginWithGoogle()}; const logout=()=>{void logoutFromGoogle()};
   const openTournament=(id:string)=>{setSelected(id);setPage('detail')};
